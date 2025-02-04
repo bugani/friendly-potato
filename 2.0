@@ -1,0 +1,195 @@
+import requests
+import os
+
+# Настройки Bitbucket
+BITBUCKET_USERNAME = "your_username"
+BITBUCKET_APP_PASSWORD = "your_app_password"
+BITBUCKET_REPO = "your_repo_name"
+BITBUCKET_BRANCH = "main"  # Ветка, из которой будем брать файлы
+
+# Функция для получения списка файлов в репозитории
+def get_files_from_bitbucket(path=""):
+    url = f"https://api.bitbucket.org/2.0/repositories/{BITBUCKET_USERNAME}/{BITBUCKET_REPO}/src/{BITBUCKET_BRANCH}/{path}"
+    response = requests.get(url, auth=(BITBUCKET_USERNAME, BITBUCKET_APP_PASSWORD))
+    
+    if response.status_code == 200:
+        files = []
+        for item in response.json().get('values', []):
+            if item['type'] == 'commit_file':
+                files.append(item['path'])
+            elif item['type'] == 'commit_directory':
+                # Рекурсивно получаем файлы из поддиректорий
+                files.extend(get_files_from_bitbucket(item['path']))
+        return files
+    else:
+        print(f"Ошибка при получении списка файлов: {response.status_code}, {response.text}")
+        return []
+# Функция для загрузки файла из Bitbucket
+def download_file_from_bitbucket(file_path):
+    url = f"https://api.bitbucket.org/2.0/repositories/{BITBUCKET_USERNAME}/{BITBUCKET_REPO}/src/{BITBUCKET_BRANCH}/{file_path}"
+    response = requests.get(url, auth=(BITBUCKET_USERNAME, BITBUCKET_APP_PASSWORD))
+    
+    if response.status_code == 200:
+        # Сохраняем файл локально
+        file_name = os.path.basename(file_path)
+        with open(file_name, 'wb') as file:
+            file.write(response.content)
+        print(f"Файл {file_name} успешно загружен.")
+        return file_name
+    else:
+        print(f"Ошибка при загрузке файла {file_path}: {response.status_code}, {response.text}")
+        return None
+import json
+
+# Функция для парсинга JSON-файла
+def parse_json_file(file_name):
+    with open(file_name, 'r') as file:
+        data = json.load(file)
+
+    # Извлекаем данные из блока "limits"
+    limits = data.get('limits', [])
+    metrics = []
+
+    # Извлекаем значение acquireTicket из JSON
+    acquire_ticket = data.get("acquireTicket", "default_acquire_ticket")
+
+    # Извлекаем значение EKDOS и env из имени файла
+    file_parts = file_name.split("_")
+    ekdos = file_parts[0]  # EKDOS - первая часть имени файла
+    env = file_parts[0]    # env - первая часть имени файла (можно изменить логику, если env находится в другом месте)
+
+    for limit in limits:
+        uri_prefix = limit.get('uri_prefix', '')
+        http_methods = limit.get('http_methods', [])
+        
+        for method in http_methods:
+            http_method = method.get('http_method', '')
+            invokers = method.get('invokers', [])
+            
+            for invoker in invokers:
+                header_value = invoker.get('header_value', '')
+                value = invoker.get('value', 0)
+                
+                # Формируем метрику в нужном формате
+                metric_name = 'calc_service_requesttime'
+                labels = f'Dimension="{acquire_ticket},{header_value},{ekdos}",env="{env}"'
+                
+                # Сохраняем метрику для дальнейшего использования
+                metrics.append({
+                    'metric_name': metric_name,
+                    'labels': labels,
+                    'value': value
+                })
+
+    return metrics
+# Настройки Grafana
+GRAFANA_URL = "http://localhost:3000"  # URL Grafana
+GRAFANA_API_KEY = "your_api_key_here"  # API-ключ Grafana
+
+# Заголовки для запросов
+headers = {
+    "Authorization": f"Bearer {GRAFANA_API_KEY}",
+    "Content-Type": "application/json"
+}
+
+# Создание дашборда
+def create_dashboard(metrics):
+    dashboard = {
+        "dashboard": {
+            "title": "Service Request Time Dashboard",
+            "panels": []
+        },
+        "folderId": 0,  # ID папки (0 для корневой папки)
+        "overwrite": False
+    }
+
+    for i, metric in enumerate(metrics):
+        panel = {
+            "type": "graph",
+            "title": f"Panel {i + 1} - {metric['labels']}",
+            "gridPos": {
+                "x": (i % 2) * 12,
+                "y": (i // 2) * 8,
+                "w": 12,
+                "h": 8
+            },
+            "targets": [
+                {
+                    "expr": f"{metric['metric_name']}{{{metric['labels']}}}",
+                    "refId": "A"
+                }
+            ]
+        }
+        dashboard["dashboard"]["panels"].append(panel)
+
+    response = requests.post(
+        f"{GRAFANA_URL}/api/dashboards/db",
+        headers=headers,
+        json=dashboard
+    )
+    if response.status_code == 200:
+        print("Дашборд успешно создан!")
+    else:
+        print(f"Ошибка при создании дашборда: {response.status_code}, {response.text}")
+
+# Создание алерта
+# Создание алерта
+def create_alert(metric):
+    # Умножаем значение триггера на 2
+    trigger_value = metric['value'] * 2
+
+    alert = {
+        "name": f"Alert for {metric['labels']}",
+        "condition": {
+            "evaluator": {
+                "params": [trigger_value],  # Используем умноженное значение
+                "type": "gt"  # Условие: значение больше указанного
+            },
+            "query": {
+                "params": [
+                    f"{metric['metric_name']}{{{metric['labels']}}}",
+                    "now-5m",
+                    "now"
+                ]
+            }
+        },
+        "notifications": [
+            {
+                "uid": "your_notification_channel_uid"  # UID канала уведомлений
+            }
+        ],
+        "labels": {
+            "env": metric['labels'].split('env="')[1].split('"')[0]  # Извлекаем env из лейблов
+        }
+    }
+
+    response = requests.post(
+        f"{GRAFANA_URL}/api/alerts",
+        headers=headers,
+        json=alert
+    )
+    if response.status_code == 200:
+        print(f"Алерт для {metric['labels']} успешно создан! Пороговое значение: {trigger_value}")
+    else:
+        print(f"Ошибка при создании алерта: {response.status_code}, {response.text}")
+if __name__ == '__main__':
+    # Получаем список всех файлов в репозитории
+    files = get_files_from_bitbucket()
+    
+    # Фильтруем только JSON-файлы
+    json_files = [file for file in files if file.endswith('.json')]
+    
+    # Обрабатываем каждый JSON-файл
+    for file_path in json_files:
+        # Загружаем файл из Bitbucket
+        file_name = download_file_from_bitbucket(file_path)
+        if file_name:
+            # Парсим JSON-файл
+            metrics = parse_json_file(file_name)
+            
+            # Создаем дашборд
+            create_dashboard(metrics)
+            
+            # Создаем алерты для каждой метрики
+            for metric in metrics:
+                create_alert(metric)
